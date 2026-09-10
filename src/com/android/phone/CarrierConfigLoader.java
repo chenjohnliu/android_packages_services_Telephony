@@ -133,7 +133,8 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
     // Number of phone instances (active modem count)
     private int mNumPhones;
 
-    // Device opt-in. This supplies only a missing carrier default, never a force override.
+    // Device opt-in for vendor IMS stacks that determine carrier support from their own database.
+    // User, provisioning, subscription, and actual IMS-registration gates continue to apply.
     private final boolean mAllowSim1VolteFallback;
     private volatile long mVolteConfigGeneration;
     private volatile VolteConfigProof mVolteDefaultProof, mVolteCarrierProof;
@@ -163,8 +164,14 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
 
         boolean matches(PersistableBundle current, CarrierIdentifier carrier, int subId,
                 long generation) {
-            return config != null && config == current && this.carrier != null
-                    && this.carrier.equals(carrier) && this.subId == subId
+            // CarrierIdentifier.equals() also compares fields such as SPN, IMSI and GIDs. Those
+            // fields are populated in stages after a physical SIM hot-swap, so the same SIM can
+            // stop matching the proof even though its stable carrier identity is unchanged.
+            final boolean sameStableCarrier = this.carrier != null && carrier != null
+                    && TextUtils.equals(this.carrier.getMcc(), carrier.getMcc())
+                    && TextUtils.equals(this.carrier.getMnc(), carrier.getMnc())
+                    && this.carrier.getCarrierId() == carrier.getCarrierId();
+            return config != null && config == current && sameStableCarrier && this.subId == subId
                     && this.generation == generation;
         }
     }
@@ -1350,9 +1357,6 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
         int phoneId = SubscriptionManager.getPhoneId(subscriptionId);
         PersistableBundle retConfig = CarrierConfigManager.getDefaultConfig();
         if (SubscriptionManager.isValidPhoneId(phoneId)) {
-            if (phoneId == 0 && shouldApplyVolteFallback(subscriptionId)) {
-                retConfig.putBoolean(CarrierConfigManager.KEY_CARRIER_VOLTE_AVAILABLE_BOOL, true);
-            }
             PersistableBundle config = mConfigFromDefaultApp[phoneId];
             if (config != null) {
                 retConfig.putAll(config);
@@ -1368,6 +1372,14 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
             config = mOverrideConfigs[phoneId];
             if (config != null) {
                 retConfig.putAll(config);
+            }
+            // Apply the device fallback after every CarrierConfig layer. The platform default
+            // bundle contains carrier_volte_available_bool=false, so applying this before the
+            // merges makes the opt-in disappear once a complete config is loaded after SIM
+            // hot-swap. shouldApplyVolteFallback() already restricts this to a proven, current,
+            // single-SIM slot-0/default-data configuration.
+            if (phoneId == 0 && shouldApplyVolteFallback(subscriptionId)) {
+                retConfig.putBoolean(CarrierConfigManager.KEY_CARRIER_VOLTE_AVAILABLE_BOOL, true);
             }
             // Ignore the theoretical case of the default app not being present since that won't
             // work in CarrierConfigLoader today.
