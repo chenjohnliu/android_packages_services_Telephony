@@ -135,12 +135,15 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
 
     // Device opt-in for vendor IMS stacks that determine carrier support from their own database.
     // User, provisioning, subscription, and actual IMS-registration gates continue to apply.
-    private final boolean mAllowSim1VolteFallback;
-    private volatile long mVolteConfigGeneration;
-    private volatile VolteConfigProof mVolteDefaultProof, mVolteCarrierProof;
+    private static final int MAX_VOLTE_FALLBACK_PHONES = 2;
+    private final boolean mAllowSingleActiveSimVolteFallback;
+    // Each phone has an independent proof epoch. A config response for one phone must never
+    // satisfy or invalidate the other phone's fallback eligibility.
+    private long[] mVolteConfigGeneration;
+    private VolteConfigProof[] mVolteDefaultProof, mVolteCarrierProof;
     // Accessed only on mHandler; subscription notifications can repeat without policy changes.
-    private int mLastVolteSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
-    private boolean mLastVolteFallback;
+    private int[] mLastVolteSubId;
+    private boolean[] mLastVolteFallback;
     private final SubscriptionManager.OnSubscriptionsChangedListener mVolteSubscriptionsListener =
             new SubscriptionManager.OnSubscriptionsChangedListener() {
                 @Override public void onSubscriptionsChanged() {
@@ -326,8 +329,8 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
                                         + phoneId);
                         mConfigFromDefaultApp[phoneId] = config;
                         recordVolteConfigProof(phoneId, true, config,
-                                getCarrierIdentifierForPhoneId(phoneId), currentVolteSubId(),
-                                mVolteConfigGeneration);
+                                getCarrierIdentifierForPhoneId(phoneId),
+                                currentVolteSubId(phoneId), volteConfigGeneration(phoneId));
                         Message newMsg = obtainMessage(EVENT_FETCH_DEFAULT_DONE, phoneId, -1);
                         newMsg.getData().putBoolean("loaded_from_xml", true);
                         mHandler.sendMessage(newMsg);
@@ -365,8 +368,8 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
                         break;
                     }
                     final CarrierIdentifier carrierId = getCarrierIdentifierForPhoneId(phoneId);
-                    final int volteSubId = currentVolteSubId();
-                    final long volteGeneration = mVolteConfigGeneration;
+                    final int volteSubId = currentVolteSubId(phoneId);
+                    final long volteGeneration = volteConfigGeneration(phoneId);
                     // ResultReceiver callback will execute in this Handler's thread.
                     final ResultReceiver resultReceiver =
                             new ResultReceiver(this) {
@@ -467,8 +470,8 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
                                         + phoneId);
                         mConfigFromCarrierApp[phoneId] = config;
                         recordVolteConfigProof(phoneId, false, config,
-                                getCarrierIdentifierForPhoneId(phoneId), currentVolteSubId(),
-                                mVolteConfigGeneration);
+                                getCarrierIdentifierForPhoneId(phoneId),
+                                currentVolteSubId(phoneId), volteConfigGeneration(phoneId));
                         Message newMsg = obtainMessage(EVENT_FETCH_CARRIER_DONE, phoneId, -1);
                         newMsg.getData().putBoolean("loaded_from_xml", true);
                         sendMessage(newMsg);
@@ -502,8 +505,8 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
                         break;
                     }
                     final CarrierIdentifier carrierId = getCarrierIdentifierForPhoneId(phoneId);
-                    final int volteSubId = currentVolteSubId();
-                    final long volteGeneration = mVolteConfigGeneration;
+                    final int volteSubId = currentVolteSubId(phoneId);
+                    final long volteGeneration = volteConfigGeneration(phoneId);
                     // ResultReceiver callback will execute in this Handler's thread.
                     final ResultReceiver resultReceiver =
                             new ResultReceiver(this) {
@@ -746,7 +749,7 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
     /* package */ CarrierConfigLoader(@NonNull Context context,
             @NonNull SubscriptionInfoUpdater subscriptionInfoUpdater, @NonNull Looper looper) {
         mContext = context;
-        mAllowSim1VolteFallback = context.getResources().getBoolean(
+        mAllowSingleActiveSimVolteFallback = context.getResources().getBoolean(
                 R.bool.config_allow_sim1_volte_carrier_default_fallback);
         mPlatformCarrierConfigPackage =
                 mContext.getString(R.string.platform_carrier_config_package);
@@ -754,7 +757,7 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
 
         IntentFilter systemEventsFilter = new IntentFilter();
         systemEventsFilter.addAction(Intent.ACTION_BOOT_COMPLETED);
-        if (mAllowSim1VolteFallback) {
+        if (mAllowSingleActiveSimVolteFallback) {
             systemEventsFilter.addAction(TelephonyManager.ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED);
         }
         systemEventsFilter.addAction(TelephonyManager.ACTION_MULTI_SIM_CONFIG_CHANGED);
@@ -773,6 +776,12 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
         mServiceConnectionForNoSimConfig = new CarrierServiceConnection[mNumPhones];
         mServiceBoundForNoSimConfig = new boolean[mNumPhones];
         mCarrierServiceChangeCallbacks = new CarrierServiceChangeCallback[mNumPhones];
+        mVolteConfigGeneration = new long[mNumPhones];
+        mVolteDefaultProof = new VolteConfigProof[mNumPhones];
+        mVolteCarrierProof = new VolteConfigProof[mNumPhones];
+        mLastVolteSubId = new int[mNumPhones];
+        Arrays.fill(mLastVolteSubId, SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+        mLastVolteFallback = new boolean[mNumPhones];
         for (int phoneId = 0; phoneId < mNumPhones; phoneId++) {
             mCarrierServiceChangeCallbacks[phoneId] = new CarrierServiceChangeCallback(phoneId);
             TelephonyManager.from(context).registerCarrierPrivilegesCallback(phoneId,
@@ -780,7 +789,7 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
         }
         logd("CarrierConfigLoader has started");
         mSubscriptionInfoUpdater = subscriptionInfoUpdater;
-        if (mAllowSim1VolteFallback) {
+        if (mAllowSingleActiveSimVolteFallback) {
             SubscriptionManager.from(context).addOnSubscriptionsChangedListener(
                     new HandlerExecutor(mHandler), mVolteSubscriptionsListener);
         }
@@ -867,9 +876,10 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
     }
 
     private void broadcastConfigChangedIntent(int phoneId, boolean addSubIdExtra) {
-        if (mAllowSim1VolteFallback && phoneId == 0) {
-            mLastVolteSubId = currentVolteSubId();
-            mLastVolteFallback = shouldApplyVolteFallback(mLastVolteSubId);
+        if (isVolteFallbackPhoneId(phoneId)) {
+            mLastVolteSubId[phoneId] = currentVolteSubId(phoneId);
+            mLastVolteFallback[phoneId] =
+                    shouldApplyVolteFallback(phoneId, mLastVolteSubId[phoneId]);
         }
         Intent intent = new Intent(CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED);
         intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT |
@@ -1329,6 +1339,16 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
         mHasSentConfigChange = Arrays.copyOf(mHasSentConfigChange, mNumPhones);
         mFromSystemUnlocked = Arrays.copyOf(mFromSystemUnlocked, mNumPhones);
         mCarrierServiceChangeCallbacks = Arrays.copyOf(mCarrierServiceChangeCallbacks, mNumPhones);
+        final int oldVolteStateSize = mVolteConfigGeneration.length;
+        mVolteConfigGeneration = Arrays.copyOf(mVolteConfigGeneration, mNumPhones);
+        mVolteDefaultProof = Arrays.copyOf(mVolteDefaultProof, mNumPhones);
+        mVolteCarrierProof = Arrays.copyOf(mVolteCarrierProof, mNumPhones);
+        mLastVolteSubId = Arrays.copyOf(mLastVolteSubId, mNumPhones);
+        if (mNumPhones > oldVolteStateSize) {
+            Arrays.fill(mLastVolteSubId, oldVolteStateSize, mNumPhones,
+                    SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+        }
+        mLastVolteFallback = Arrays.copyOf(mLastVolteFallback, mNumPhones);
 
         // Load the config for all the phones and re-register callback AFTER padding the arrays.
         for (int phoneId = 0; phoneId < mNumPhones; phoneId++) {
@@ -1377,8 +1397,8 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
             // bundle contains carrier_volte_available_bool=false, so applying this before the
             // merges makes the opt-in disappear once a complete config is loaded after SIM
             // hot-swap. shouldApplyVolteFallback() already restricts this to a proven, current,
-            // single-SIM slot-0/default-data configuration.
-            if (phoneId == 0 && shouldApplyVolteFallback(subscriptionId)) {
+            // single-active-SIM slot/phone/default-data configuration.
+            if (shouldApplyVolteFallback(phoneId, subscriptionId)) {
                 retConfig.putBoolean(CarrierConfigManager.KEY_CARRIER_VOLTE_AVAILABLE_BOOL, true);
             }
             // Ignore the theoretical case of the default app not being present since that won't
@@ -1399,54 +1419,65 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
 
 
     private synchronized void invalidateVolteConfigProof(int phoneId) {
-        if (mAllowSim1VolteFallback && phoneId == 0) {
-            ++mVolteConfigGeneration;
-            mVolteDefaultProof = mVolteCarrierProof = null;
+        if (isVolteFallbackPhoneId(phoneId)) {
+            ++mVolteConfigGeneration[phoneId];
+            mVolteDefaultProof[phoneId] = mVolteCarrierProof[phoneId] = null;
         }
     }
 
     private synchronized void recordVolteConfigProof(int phoneId, boolean fromDefault,
             PersistableBundle config, CarrierIdentifier carrier, int subId, long generation) {
-        if (!mAllowSim1VolteFallback || phoneId != 0 || config == null
-                || generation != mVolteConfigGeneration) return;
+        if (!isVolteFallbackPhoneId(phoneId) || config == null
+                || generation != mVolteConfigGeneration[phoneId]) return;
         VolteConfigProof proof = new VolteConfigProof(config, carrier, subId, generation);
-        if (fromDefault) mVolteDefaultProof = proof;
-        else mVolteCarrierProof = proof;
+        if (fromDefault) mVolteDefaultProof[phoneId] = proof;
+        else mVolteCarrierProof[phoneId] = proof;
     }
 
-    private int currentVolteSubId() {
-        if (!mAllowSim1VolteFallback || mNumPhones == 0) {
+    private synchronized long volteConfigGeneration(int phoneId) {
+        return isVolteFallbackPhoneId(phoneId) ? mVolteConfigGeneration[phoneId] : -1;
+    }
+
+    private boolean isVolteFallbackPhoneId(int phoneId) {
+        return mAllowSingleActiveSimVolteFallback && phoneId >= 0
+                && phoneId < mNumPhones && phoneId < MAX_VOLTE_FALLBACK_PHONES;
+    }
+
+    private int currentVolteSubId(int phoneId) {
+        if (!isVolteFallbackPhoneId(phoneId)) {
             return SubscriptionManager.INVALID_SUBSCRIPTION_ID;
         }
-        int[] subIds = SubscriptionManager.getSubId(0);
+        int[] subIds = SubscriptionManager.getSubId(phoneId);
         return ArrayUtils.isEmpty(subIds) ? SubscriptionManager.INVALID_SUBSCRIPTION_ID : subIds[0];
     }
 
-    private boolean shouldApplyVolteFallback(int subId) {
-        if (!mAllowSim1VolteFallback || mNumPhones == 0
+    private synchronized boolean shouldApplyVolteFallback(int phoneId, int subId) {
+        if (!isVolteFallbackPhoneId(phoneId)
                 || !SubscriptionManager.isValidSubscriptionId(subId)) return false;
         // The getter can run on a caller's Binder identity. Query the full active-SIM set as
         // Telephony, so a carrier-privileged caller cannot accidentally hide the second SIM.
         final long identity = Binder.clearCallingIdentity();
         try {
-            if (subId != currentVolteSubId()
+            if (SubscriptionManager.getPhoneId(subId) != phoneId
+                    || SubscriptionManager.getSlotIndex(subId) != phoneId
+                    || subId != currentVolteSubId(phoneId)
                     || subId != SubscriptionManager.getDefaultDataSubscriptionId()) return false;
             List<SubscriptionInfo> active = SubscriptionManager.from(mContext)
                     .getActiveSubscriptionInfoList(false);
             if (active == null || active.size() != 1
                     || active.get(0).getSubscriptionId() != subId
-                    || active.get(0).getSimSlotIndex() != 0) return false;
-            CarrierIdentifier carrier = getCarrierIdentifierForPhoneId(0);
-            long generation = mVolteConfigGeneration;
-            VolteConfigProof defaults = mVolteDefaultProof;
-            if (defaults == null || !defaults.matches(mConfigFromDefaultApp[0], carrier,
+                    || active.get(0).getSimSlotIndex() != phoneId) return false;
+            CarrierIdentifier carrier = getCarrierIdentifierForPhoneId(phoneId);
+            long generation = mVolteConfigGeneration[phoneId];
+            VolteConfigProof defaults = mVolteDefaultProof[phoneId];
+            if (defaults == null || !defaults.matches(mConfigFromDefaultApp[phoneId], carrier,
                     subId, generation)) return false;
-            if (getCarrierPackageForPhoneId(0) != null) {
-                VolteConfigProof overrides = mVolteCarrierProof;
-                if (overrides == null || !overrides.matches(mConfigFromCarrierApp[0], carrier,
-                        subId, generation)) return false;
+            if (getCarrierPackageForPhoneId(phoneId) != null) {
+                VolteConfigProof overrides = mVolteCarrierProof[phoneId];
+                if (overrides == null || !overrides.matches(mConfigFromCarrierApp[phoneId],
+                        carrier, subId, generation)) return false;
             }
-            return generation == mVolteConfigGeneration;
+            return generation == mVolteConfigGeneration[phoneId];
         } finally {
             Binder.restoreCallingIdentity(identity);
         }
@@ -1455,13 +1486,17 @@ public class CarrierConfigLoader extends ICarrierConfigLoader.Stub {
     // No reload and no subscription database writes: only notify IMS to re-read on an actual
     // DDS/active-SIM policy transition. Carrier-config broadcasts do not feed this listener.
     private void refreshVolteFallback() {
-        if (!mAllowSim1VolteFallback || mNumPhones == 0) return;
-        int subId = currentVolteSubId();
-        boolean available = shouldApplyVolteFallback(subId);
-        if (subId == mLastVolteSubId && available == mLastVolteFallback) return;
-        mLastVolteSubId = subId;
-        mLastVolteFallback = available;
-        broadcastConfigChangedIntent(0);
+        if (!mAllowSingleActiveSimVolteFallback || mNumPhones == 0) return;
+        final int phoneCount = Math.min(mNumPhones, MAX_VOLTE_FALLBACK_PHONES);
+        for (int phoneId = 0; phoneId < phoneCount; ++phoneId) {
+            int subId = currentVolteSubId(phoneId);
+            boolean available = shouldApplyVolteFallback(phoneId, subId);
+            if (subId == mLastVolteSubId[phoneId]
+                    && available == mLastVolteFallback[phoneId]) continue;
+            mLastVolteSubId[phoneId] = subId;
+            mLastVolteFallback[phoneId] = available;
+            broadcastConfigChangedIntent(phoneId);
+        }
     }
 
     @Override
