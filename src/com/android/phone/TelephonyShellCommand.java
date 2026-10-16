@@ -29,6 +29,7 @@ import android.os.PersistableBundle;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.ServiceSpecificException;
+import android.os.SystemProperties;
 import android.provider.BlockedNumberContract;
 import android.telephony.BarringInfo;
 import android.telephony.CarrierConfigManager;
@@ -1491,10 +1492,17 @@ public class TelephonyShellCommand extends BasicShellCommandHandler {
                 || Binder.getCallingUid() == Process.ROOT_UID;
     }
 
+    private static boolean isRootOnDebugBuild(int uid, String buildType) {
+        return uid == Process.ROOT_UID
+                && ("userdebug".equals(buildType) || "eng".equals(buildType));
+    }
+
     private int handleCcCommand() {
-        // Verify that the user is allowed to run the command. Only allowed in rooted device in a
-        // non user build.
-        if (Binder.getCallingUid() != Process.ROOT_UID || TelephonyUtils.IS_USER) {
+        // Verify that the user is allowed to run the command. Only allow root on an explicit
+        // userdebug or eng build.
+        // Build.TYPE may be process-spoofed by ROM property hooks, so read the real property.
+        if (!isRootOnDebugBuild(Binder.getCallingUid(),
+                SystemProperties.get("ro.build.type", ""))) {
             getErrPrintWriter().println("cc: Permission denied.");
             return -1;
         }

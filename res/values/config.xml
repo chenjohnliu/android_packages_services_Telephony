@@ -317,4 +317,7 @@
     <!-- The package names which can request thermal mitigation. -->
     <string-array name="thermal_mitigation_allowlisted_packages" translatable="false">
     </string-array>
+    <!-- Missing-carrier-key fallback for the validated single-SIM1 IMS integration.
+         Explicit carrier configuration and all IMS user/provisioning gates still apply. -->
+    <bool name="config_allow_sim1_volte_carrier_default_fallback">false</bool>
 </resources>
